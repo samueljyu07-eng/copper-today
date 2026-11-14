@@ -1,7 +1,8 @@
-"""SQLite storage: one metrics row per day, plus press-release markers."""
+"""SQLite storage: one metrics row per day, plus press releases, stories, and scores."""
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -70,6 +71,75 @@ def init_db(conn: sqlite3.Connection) -> None:
     for name, column_type in COLUMNS:
         if name not in existing:
             conn.execute(f"ALTER TABLE daily_metrics ADD COLUMN {name} {column_type}")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS sampled_posts (
+            date TEXT NOT NULL,
+            post_id TEXT NOT NULL,
+            text TEXT NOT NULL,
+            impression_count INTEGER,
+            like_count INTEGER NOT NULL,
+            repost_count INTEGER NOT NULL,
+            reply_count INTEGER NOT NULL,
+            quote_count INTEGER NOT NULL,
+            engagement INTEGER NOT NULL,
+            PRIMARY KEY (date, post_id)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS daily_stories (
+            date TEXT NOT NULL,
+            rank INTEGER NOT NULL,
+            headline TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            category TEXT NOT NULL,
+            impressions INTEGER NOT NULL,
+            engagement INTEGER NOT NULL,
+            unverified INTEGER NOT NULL,
+            links_json TEXT NOT NULL,
+            PRIMARY KEY (date, rank)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS story_runs (
+            date TEXT PRIMARY KEY,
+            status TEXT NOT NULL,
+            detail TEXT,
+            model TEXT,
+            input_tokens INTEGER,
+            output_tokens INTEGER,
+            estimated_cost_usd REAL,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS daily_scores (
+            date TEXT PRIMARY KEY,
+            attention_index REAL,
+            news_impressions INTEGER,
+            news_flow REAL,
+            score REAL,
+            color TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            attention_weight REAL NOT NULL,
+            news_weight REAL NOT NULL,
+            price_change_pct REAL,
+            post_count_percentile REAL,
+            top_story_impressions INTEGER,
+            score_percentile REAL,
+            day_type TEXT NOT NULL,
+            history_days INTEGER NOT NULL,
+            comparison_days INTEGER NOT NULL,
+            computed_at TEXT NOT NULL
+        )
+        """
+    )
 
 
 @contextmanager
@@ -175,3 +245,165 @@ def list_press_releases(conn: sqlite3.Connection) -> list[dict]:
 
 def delete_press_release(conn: sqlite3.Connection, release_id: int) -> None:
     conn.execute("DELETE FROM press_releases WHERE id = ?", (int(release_id),))
+
+
+def clear_stories_and_scores(conn: sqlite3.Connection) -> None:
+    conn.execute("DELETE FROM sampled_posts")
+    conn.execute("DELETE FROM daily_stories")
+    conn.execute("DELETE FROM story_runs")
+    conn.execute("DELETE FROM daily_scores")
+
+
+def replace_sampled_posts(conn: sqlite3.Connection, day: str, posts: list[dict]) -> None:
+    datetime.strptime(day, "%Y-%m-%d")
+    conn.execute("DELETE FROM sampled_posts WHERE date = ?", (day,))
+    for post in posts:
+        conn.execute(
+            """
+            INSERT INTO sampled_posts (
+                date, post_id, text, impression_count, like_count,
+                repost_count, reply_count, quote_count, engagement
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                day,
+                post["post_id"],
+                post["text"],
+                post["impression_count"],
+                int(post["like_count"]),
+                int(post["repost_count"]),
+                int(post["reply_count"]),
+                int(post["quote_count"]),
+                int(post["engagement"]),
+            ),
+        )
+
+
+def load_sampled_posts(conn: sqlite3.Connection, day: str) -> list[dict]:
+    rows = conn.execute(
+        """
+        SELECT * FROM sampled_posts
+        WHERE date = ?
+        ORDER BY engagement DESC, impression_count DESC, post_id
+        """,
+        (day,),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def replace_stories(conn: sqlite3.Connection, day: str, stories: list[dict]) -> None:
+    datetime.strptime(day, "%Y-%m-%d")
+    conn.execute("DELETE FROM daily_stories WHERE date = ?", (day,))
+    for story in stories:
+        conn.execute(
+            """
+            INSERT INTO daily_stories (
+                date, rank, headline, summary, category, impressions,
+                engagement, unverified, links_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                day,
+                int(story["rank"]),
+                story["headline"],
+                story["summary"],
+                story["category"],
+                int(story["impressions"]),
+                int(story["engagement"]),
+                1 if story["unverified"] else 0,
+                json.dumps(story["links"], separators=(",", ":")),
+            ),
+        )
+
+
+def list_stories(conn: sqlite3.Connection, day: str | None = None) -> list[dict]:
+    if day is None:
+        rows = conn.execute("SELECT * FROM daily_stories ORDER BY date, rank").fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM daily_stories WHERE date = ? ORDER BY rank",
+            (day,),
+        ).fetchall()
+    stories = []
+    for row in rows:
+        item = dict(row)
+        item["links"] = json.loads(item.pop("links_json") or "[]")
+        item["unverified"] = bool(item["unverified"])
+        stories.append(item)
+    return stories
+
+
+def save_story_run(
+    conn: sqlite3.Connection,
+    day: str,
+    *,
+    status: str,
+    detail: str | None,
+    model: str | None = None,
+    input_tokens: int | None = None,
+    output_tokens: int | None = None,
+    estimated_cost_usd: float | None = None,
+) -> None:
+    datetime.strptime(day, "%Y-%m-%d")
+    created = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    conn.execute(
+        """
+        INSERT INTO story_runs (
+            date, status, detail, model, input_tokens, output_tokens,
+            estimated_cost_usd, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(date) DO UPDATE SET
+            status = excluded.status,
+            detail = excluded.detail,
+            model = excluded.model,
+            input_tokens = excluded.input_tokens,
+            output_tokens = excluded.output_tokens,
+            estimated_cost_usd = excluded.estimated_cost_usd,
+            created_at = excluded.created_at
+        """,
+        (day, status, detail, model, input_tokens, output_tokens, estimated_cost_usd, created),
+    )
+
+
+def list_story_runs(conn: sqlite3.Connection) -> list[dict]:
+    rows = conn.execute("SELECT * FROM story_runs ORDER BY date").fetchall()
+    return [dict(row) for row in rows]
+
+
+def save_scores(conn: sqlite3.Connection, rows: list[dict]) -> None:
+    conn.execute("DELETE FROM daily_scores")
+    for row in rows:
+        conn.execute(
+            """
+            INSERT INTO daily_scores (
+                date, attention_index, news_impressions, news_flow, score, color,
+                reason, attention_weight, news_weight, price_change_pct,
+                post_count_percentile, top_story_impressions, score_percentile,
+                day_type, history_days, comparison_days, computed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                row["date"],
+                row["attention_index"],
+                row["news_impressions"],
+                row["news_flow"],
+                row["score"],
+                row["color"],
+                row["reason"],
+                row["attention_weight"],
+                row["news_weight"],
+                row["price_change_pct"],
+                row["post_count_percentile"],
+                row["top_story_impressions"],
+                row["score_percentile"],
+                row["day_type"],
+                int(row["history_days"]),
+                int(row["comparison_days"]),
+                row["computed_at"],
+            ),
+        )
+
+
+def list_scores(conn: sqlite3.Connection) -> list[dict]:
+    rows = conn.execute("SELECT * FROM daily_scores ORDER BY date").fetchall()
+    return [dict(row) for row in rows]

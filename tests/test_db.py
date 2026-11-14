@@ -61,3 +61,55 @@ def test_press_release_round_trip(tmp_path: Path):
         assert releases[0]["label"] == "Mill update"
         delete_press_release(conn, release_id)
         assert list_press_releases(conn) == []
+
+
+def test_stories_round_trip(tmp_path: Path):
+    from copper_today.db import list_stories, load_sampled_posts, replace_sampled_posts, replace_stories
+
+    with connect(tmp_path / "copper.db") as conn:
+        replace_sampled_posts(
+            conn,
+            "2026-11-10",
+            [
+                {
+                    "post_id": "55",
+                    "text": "Copper inventories fell.",
+                    "impression_count": 9,
+                    "like_count": 1,
+                    "repost_count": 2,
+                    "reply_count": 3,
+                    "quote_count": 0,
+                    "engagement": 6,
+                }
+            ],
+        )
+        replace_stories(
+            conn,
+            "2026-11-10",
+            [
+                {
+                    "rank": 1,
+                    "headline": "Inventories",
+                    "summary": "A post says copper inventories fell.",
+                    "category": "policy and supply chain",
+                    "impressions": 9,
+                    "engagement": 6,
+                    "unverified": True,
+                    "links": [
+                        {
+                            "id": "55",
+                            "url": "https://x.com/i/web/status/55",
+                            "engagement": 6,
+                            "impressions": 9,
+                            "text": "Copper inventories fell.",
+                        }
+                    ],
+                }
+            ],
+        )
+        posts = load_sampled_posts(conn, "2026-11-10")
+        stories = list_stories(conn, "2026-11-10")
+    assert posts[0]["post_id"] == "55"
+    assert stories[0]["headline"] == "Inventories"
+    assert stories[0]["unverified"] is True
+    assert stories[0]["links"][0]["url"] == "https://x.com/i/web/status/55"

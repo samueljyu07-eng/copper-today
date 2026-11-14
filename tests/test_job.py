@@ -4,9 +4,10 @@ from pathlib import Path
 import pytest
 
 from copper_today.analytics import prepare
-from copper_today.db import connect, get_day, has_metrics, is_demo, upsert_day
+from copper_today.db import connect, get_day, has_metrics, is_demo, list_stories, load_sampled_posts, upsert_day
 from copper_today.demo import build_demo_rows
 from copper_today.job import JobError, main, run_job
+from copper_today.stories import GroupedStories, StoryError
 from copper_today.x_client import SourceError
 
 NOW = datetime(2026, 11, 11, 18, 0, tzinfo=timezone.utc)
@@ -287,3 +288,86 @@ def test_note_survives_a_later_skip(tmp_path: Path):
     with connect(database) as conn:
         row = get_day(conn, "2026-11-10")
     assert row["note"] == "1 post had no impression_count"
+
+
+def _story_result():
+    return GroupedStories(
+        stories=[
+            {
+                "rank": 1,
+                "headline": "Copper price talk",
+                "summary": "Posts say the copper price moved.",
+                "category": "copper price and macro",
+                "unverified": True,
+                "impressions": 8,
+                "engagement": 2,
+                "links": [
+                    {
+                        "id": "42",
+                        "url": "https://x.com/i/web/status/42",
+                        "engagement": 2,
+                        "impressions": 8,
+                        "text": "Copper price moved today.",
+                    }
+                ],
+            }
+        ],
+        model="claude-haiku-5-5",
+        input_tokens=800,
+        output_tokens=120,
+        estimated_cost_usd=0.00014,
+    )
+
+
+def test_stories_use_the_saved_posts_and_do_not_reread_x(tmp_path: Path):
+    database = tmp_path / "copper.db"
+    calls = {"search": 0, "stories": 0}
+
+    def search(day, moment):
+        calls["search"] += 1
+        return [
+            {
+                "id": "42",
+                "text": "Copper price moved today.",
+                "public_metrics": {"impression_count": 8, "like_count": 2},
+            }
+        ]
+
+    def stories(posts):
+        calls["stories"] += 1
+        if calls["stories"] == 1:
+            raise StoryError("Claude timed out")
+        assert posts[0]["post_id"] == "42"
+        assert "impression_count" in posts[0]
+        return _story_result()
+
+    kwargs = dict(
+        now=NOW,
+        token="test-token",
+        trends_fetcher=_trends,
+        futures_fetcher=_futures,
+        count_fetcher=lambda day, moment: 3,
+        search_fetcher=search,
+        story_fetcher=stories,
+    )
+    first = run_job(database, **kwargs)
+    assert first.exit_code() == 1
+    assert any(step.name == "stories" and step.status == "error" for step in first.steps)
+    with connect(database) as conn:
+        assert load_sampled_posts(conn, "2026-11-10")[0]["text"] == "Copper price moved today."
+        assert list_stories(conn, "2026-11-10") == []
+        assert get_day(conn, "2026-11-10")["post_count"] == 3
+
+    second = run_job(database, **kwargs)
+    assert second.exit_code() == 0
+    assert calls == {"search": 1, "stories": 2}
+    story_step = next(step for step in second.steps if step.name == "stories")
+    assert story_step.status == "ok"
+    assert "estimated $" in story_step.detail
+    with connect(database) as conn:
+        stored = list_stories(conn, "2026-11-10")
+    assert stored[0]["headline"] == "Copper price talk"
+    assert stored[0]["unverified"] is True
+
+    run_job(database, **kwargs)
+    assert calls == {"search": 1, "stories": 2}

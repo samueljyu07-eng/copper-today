@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import html
 import json
 import sqlite3
 from datetime import datetime, timedelta, timezone
@@ -17,10 +18,14 @@ from copper_today.config import (
     METRICS,
     MIN_PERCENTILE_OBS,
     PERCENTILE_WINDOW_DAYS,
+    SCORE_GREEN_PERCENTILE,
+    SCORE_MIN_DAYS,
+    SCORE_RED_PERCENTILE,
     TRENDS_KEYWORDS,
     get_db_path,
     load_env,
 )
+from copper_today.dates import to_iso_date
 from copper_today.db import (
     ValidationError,
     add_press_release,
@@ -28,9 +33,14 @@ from copper_today.db import (
     delete_press_release,
     get_meta,
     list_press_releases,
+    list_stories,
+    list_story_runs,
     load_days,
+    save_scores,
 )
 from copper_today.job import JobError, run_job
+from copper_today.score import build_score_rows
+from copper_today.stories import format_cost, news_totals
 
 SERIES = (
     ("post_count", "X post count", "Posts", ",.0f", "No X post counts yet."),
@@ -68,15 +78,36 @@ def main() -> None:
     load_env()
     st.set_page_config(page_title="Copper Attention", layout="wide")
     path = get_db_path()
-    with connect(path) as conn:
-        rows = load_days(conn)
-        markers = list_press_releases(conn)
-        origin = get_meta(conn, "data_origin", "") or ""
-        last_job = get_meta(conn, "last_job_json", "") or ""
+    try:
+        with connect(path) as conn:
+            rows = load_days(conn)
+            markers = list_press_releases(conn)
+            origin = get_meta(conn, "data_origin", "") or ""
+            last_job = get_meta(conn, "last_job_json", "") or ""
+            stories = list_stories(conn)
+            story_runs = list_story_runs(conn)
+    except sqlite3.Error as exc:
+        st.error(f"The dashboard could not read the saved data. {exc}")
+        return
 
-    _sidebar(path, last_job)
-    analytics = prepare(rows)
-    frame = analytics.frame
+    attention_weight = _sidebar(path, last_job)
+    try:
+        analytics = prepare(rows)
+        frame = analytics.frame
+    except Exception as exc:
+        st.error(f"The attention index could not be computed from the saved rows. {exc}")
+        analytics = None
+        frame = pd.DataFrame()
+    score_rows = build_score_rows(frame, news_totals(stories), attention_weight)
+    try:
+        with connect(path) as conn:
+            save_scores(conn, score_rows)
+    except sqlite3.Error as exc:
+        st.error(f"The score could not be saved. The badge still uses the saved metrics. {exc}")
+
+    _post_today(score_rows, frame)
+    _job_errors(last_job)
+    _trending(stories, story_runs)
 
     st.title("Copper Attention")
     st.caption(
@@ -89,13 +120,12 @@ def main() -> None:
             "These rows are synthetic demo data. Run the daily collection to replace them. "
             "A live run deletes the demo rows and keeps press-release markers."
         )
-    _job_errors(last_job)
-
     if frame.empty:
-        st.info(
-            "No rows yet. Run the daily collection from the sidebar. "
-            "It backfills Trends and COMEX history, and calls X when a bearer token is set."
-        )
+        if analytics is not None:
+            st.info(
+                "No rows yet. Run the daily collection from the sidebar. "
+                "It backfills Trends and COMEX history, and calls X when a bearer token is set."
+            )
     else:
         _headline(frame)
         _flagged_table(frame)
@@ -132,9 +162,20 @@ def main() -> None:
             "The dotted line on each chart is the mean of the last seven stored values of that series. "
             "X dates are UTC days. The futures close uses the COMEX session date."
         )
+        st.markdown("**Stories and the post-today score**")
+        st.markdown(
+            "Stories are grouped from the posts already saved for that UTC day. "
+            "The job makes one Claude call and does not read X again. "
+            "Summaries stay inside the wording of those posts. "
+            "The score blends the attention index with the combined impressions of the top three stories. "
+            f"Green is at or above the {SCORE_GREEN_PERCENTILE}th percentile of the last "
+            f"{PERCENTILE_WINDOW_DAYS} weekdays or weekends. "
+            f"Red is at or below the {SCORE_RED_PERCENTILE}th percentile. "
+            "The badge stays grey until seven days have an index."
+        )
 
 
-def _sidebar(path, last_job: str) -> None:
+def _sidebar(path, last_job: str) -> float:
     today = datetime.now(timezone.utc).date()
     with st.sidebar:
         st.header("Daily collection")
@@ -152,7 +193,10 @@ def _sidebar(path, last_job: str) -> None:
         )
         force_x = st.checkbox("Re-fetch X if this day was already collected", value=False)
         if st.button("Run daily collection", type="primary"):
-            with st.spinner("Collecting Trends, the COMEX close, and the X snapshot if it is included."):
+            with st.spinner(
+                "Collecting Trends, the COMEX close, and the X snapshot if it is included. "
+                "Stories use the posts from that snapshot."
+            ):
                 try:
                     run_job(
                         path,
@@ -173,8 +217,20 @@ def _sidebar(path, last_job: str) -> None:
             "When that limit is reached, X blocks further requests until the next cycle. "
             "A cap around $25 covers a daily snapshot with room for a few reruns. "
             "Confirm current rates in the console. At the rates published while this was built, "
-            "one full snapshot was about $0.51."
+            "one full snapshot was about $0.51. "
+            "The story grouping is a separate Claude call, once per day, and its estimated cost is stored with that day."
         )
+        st.divider()
+        st.subheader("Post today?")
+        attention_pct = st.slider(
+            "Attention index weight",
+            min_value=0,
+            max_value=100,
+            value=70,
+            step=5,
+            help="News flow gets the remaining share. The default is 70% attention index and 30% story impressions.",
+        )
+        st.caption(f"News flow weight: {100 - attention_pct}%.")
         st.divider()
         st.subheader("Press releases")
         with st.form("add_marker", clear_on_submit=True):
@@ -201,6 +257,7 @@ def _sidebar(path, last_job: str) -> None:
                 with connect(path) as conn:
                     delete_press_release(conn, release["id"])
                 st.rerun()
+        return attention_pct / 100
 
 
 def _last_job(last_job: str) -> None:
@@ -225,6 +282,218 @@ def _job_errors(last_job: str) -> None:
     errors = [step for step in payload.get("steps") or [] if step.get("status") == "error"]
     for step in errors:
         st.error(f"{step.get('name')}: {step.get('detail')}")
+
+
+_BADGE_COLORS = {
+    "green": ("#1f6b3a", "#e7f5ec"),
+    "yellow": ("#8a5a00", "#fff6dc"),
+    "red": ("#8f2d1f", "#fdecea"),
+    "calibrating": ("#5c564e", "#ece7df"),
+}
+
+
+def _post_today(score_rows: list[dict], frame: pd.DataFrame) -> None:
+    latest = score_rows[-1] if score_rows else None
+    if latest is None:
+        _badge("calibrating", "—", "Calibrating: no index reading yet.")
+        st.caption(
+            f"Colour starts after {SCORE_MIN_DAYS} days have an index. "
+            "Weekends are compared with weekends, and weekdays with weekdays."
+        )
+        return
+    _badge(latest["color"], f"{latest['score']:.1f}", latest["reason"])
+    kind = "weekends" if latest["day_type"] == "weekend" else "weekdays"
+    st.caption(
+        f"Reading for {latest['date']}, compared with other {kind}. "
+        f"Green is the top {100 - SCORE_GREEN_PERCENTILE:.0f}% of the last 30 days. "
+        f"Red is the bottom {SCORE_RED_PERCENTILE:.0f}%."
+    )
+    _history_strip(score_rows)
+    with st.expander("Score breakdown"):
+        _score_breakdown(frame, latest)
+
+
+def _badge(color: str, score: str, reason: str) -> None:
+    ink, fill = _BADGE_COLORS.get(color, _BADGE_COLORS["calibrating"])
+    label = "Calibrating" if color == "calibrating" else color.capitalize()
+    st.markdown(
+        f"""
+        <div style="border-radius:16px;padding:1.15rem 1.35rem;background:{fill};border:1px solid {ink};">
+          <div style="font-size:0.8rem;letter-spacing:0.06em;text-transform:uppercase;color:{ink};font-weight:650;">
+            Post today? · {html.escape(label)}
+          </div>
+          <div style="font-size:3.4rem;line-height:1.05;font-weight:700;color:{ink};margin:0.15rem 0 0.35rem;">
+            {html.escape(score)}
+          </div>
+          <div style="font-size:1.05rem;color:#2a211c;">{html.escape(reason)}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _history_strip(score_rows: list[dict]) -> None:
+    latest = datetime.strptime(score_rows[-1]["date"], "%Y-%m-%d").date()
+    start = latest - timedelta(days=29)
+    window = [row for row in score_rows if datetime.strptime(row["date"], "%Y-%m-%d").date() >= start]
+    if not window:
+        return
+    dots = []
+    for row in window:
+        ink, _fill = _BADGE_COLORS.get(row["color"], _BADGE_COLORS["calibrating"])
+        title = html.escape(f"{row['date']} · {row['score']:.1f} · {row['color']}", quote=True)
+        dots.append(
+            f'<span title="{title}" style="width:14px;height:14px;border-radius:50%;background:{ink};display:inline-block;"></span>'
+        )
+    st.markdown(
+        '<div style="display:flex;gap:6px;flex-wrap:wrap;margin:0.85rem 0 0.2rem;">'
+        + "".join(dots)
+        + "</div>",
+        unsafe_allow_html=True,
+    )
+    st.caption("Last 30 days. Each dot is that day's colour.")
+
+
+def _score_breakdown(frame: pd.DataFrame, score: dict) -> None:
+    row = _frame_row(frame, score["date"])
+    lines = []
+    if row is not None:
+        for key, title, _axis, fmt, _empty in SERIES:
+            lines.append(
+                {
+                    "Component": title,
+                    "Value": _num(row.get(key), fmt),
+                    "30-day percentile": _num(row.get(f"pct_{key}"), ".0f"),
+                    "Weight": "In the index",
+                }
+            )
+    lines.append(
+        {
+            "Component": "Attention index",
+            "Value": f"{score['attention_index']:.1f}",
+            "30-day percentile": "—",
+            "Weight": f"{score['attention_weight'] * 100:.0f}%",
+        }
+    )
+    if score["news_impressions"] is None:
+        news_value = "—"
+    else:
+        news_value = f"{int(score['news_impressions']):,}"
+    lines.append(
+        {
+            "Component": "News flow (top 3 story impressions)",
+            "Value": news_value,
+            "30-day percentile": _num(score["news_flow"], ".0f"),
+            "Weight": f"{score['news_weight'] * 100:.0f}%",
+        }
+    )
+    lines.append(
+        {
+            "Component": "Post today score",
+            "Value": f"{score['score']:.1f}",
+            "30-day percentile": _num(score["score_percentile"], ".0f"),
+            "Weight": "100%",
+        }
+    )
+    if score["news_flow"] is None:
+        st.caption("No story impressions for this day, so the score is the attention index.")
+    elif score["news_weight"] == 0:
+        st.caption("The news-flow weight is 0%, so the score is the attention index.")
+    st.dataframe(pd.DataFrame(lines), hide_index=True, width="stretch")
+
+
+def _frame_row(frame: pd.DataFrame, day: str):
+    if frame is None or frame.empty or "date" not in getattr(frame, "columns", []):
+        return None
+    matched = None
+    for record in frame.to_dict(orient="records"):
+        if to_iso_date(record.get("date")) == day:
+            matched = record
+    return matched
+
+
+def _trending(stories: list[dict], runs: list[dict]) -> None:
+    st.subheader("Trending on X")
+    st.caption("These are social media trends, not verified news.")
+    by_date: dict[str, list[dict]] = {}
+    for story in stories:
+        by_date.setdefault(story["date"], []).append(story)
+    runs_by_date = {run["date"]: run for run in runs}
+    if not by_date:
+        st.info(
+            "No stories stored yet. The daily collection groups the posts it already fetched. "
+            "That is one Claude call for the day, and it does not read X again."
+        )
+        _story_run_note(runs[-1] if runs else None)
+        return
+    dates = sorted(by_date, reverse=True)
+    selected = dates[0]
+    if len(dates) > 1:
+        selected = st.selectbox("Story date", dates, index=0)
+    else:
+        st.caption(f"Story date {selected}")
+    _story_run_note(runs_by_date.get(selected))
+    for story in by_date[selected]:
+        _story_card(story)
+
+
+def _story_run_note(run: dict | None) -> None:
+    if not run:
+        return
+    if run.get("status") == "error":
+        st.error(f"stories: {run.get('detail')}")
+        return
+    cost = run.get("estimated_cost_usd")
+    if cost is None:
+        return
+    tokens = f"{int(run.get('input_tokens') or 0)} in / {int(run.get('output_tokens') or 0)} out"
+    model = run.get("model") or "Claude"
+    st.caption(f"One Claude call for this day. Estimated {format_cost(float(cost))} ({tokens}, {model}).")
+
+
+def _story_card(story: dict) -> None:
+    st.markdown(f"**{int(story['rank'])}. {story['headline']}**")
+    tags = [_pill(story["category"], "#9a5b2a", "#f4eadf")]
+    if story.get("unverified"):
+        tags.append(_pill("unverified", "#8f2d1f", "#fdecea"))
+    st.markdown("".join(tags), unsafe_allow_html=True)
+    st.write(story["summary"])
+    st.caption(
+        f"Combined impressions {int(story['impressions']):,}. "
+        f"Engagement {int(story['engagement']):,} (likes, reposts, replies, quotes)."
+    )
+    for link in story.get("links") or []:
+        url = _safe_post_url(link.get("url") or "")
+        if url is None:
+            continue
+        excerpt = _excerpt(link.get("text") or "")
+        engagement = int(link.get("engagement") or 0)
+        st.markdown(f"- [{excerpt}]({url}) · engagement {engagement:,}")
+
+
+def _pill(label: str, ink: str, fill: str) -> str:
+    return (
+        f'<span style="display:inline-block;margin:0 0.4rem 0.45rem 0;padding:0.12rem 0.5rem;'
+        f"border-radius:999px;background:{fill};color:{ink};font-size:0.82rem;font-weight:650;\">"
+        f"{html.escape(label)}</span>"
+    )
+
+
+def _excerpt(text: str) -> str:
+    cleaned = " ".join(str(text or "").split()).replace("[", "(").replace("]", ")")
+    if len(cleaned) > 140:
+        return cleaned[:137] + "..."
+    return cleaned or "View post"
+
+
+def _safe_post_url(url: str) -> str | None:
+    prefix = "https://x.com/i/web/status/"
+    if not url.startswith(prefix):
+        return None
+    post_id = url[len(prefix) :]
+    if not post_id.isdigit():
+        return None
+    return url
 
 
 def _headline(frame: pd.DataFrame) -> None:

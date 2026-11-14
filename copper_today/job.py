@@ -9,19 +9,44 @@ from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
-from copper_today.config import COPPER_QUERY, FUTURES_TICKER, bearer_token, get_db_path, load_env
+from copper_today.analytics import prepare
+from copper_today.config import (
+    COPPER_QUERY,
+    DEFAULT_ATTENTION_WEIGHT,
+    FUTURES_TICKER,
+    anthropic_api_key,
+    bearer_token,
+    get_db_path,
+    load_env,
+)
 from copper_today.db import (
     clear_column,
+    clear_stories_and_scores,
     connect,
     delete_all_metrics,
     get_day,
     has_metrics,
     is_demo,
+    list_stories,
+    load_days,
+    load_sampled_posts,
+    replace_sampled_posts,
+    replace_stories,
+    save_scores,
+    save_story_run,
     set_meta,
     upsert_day,
 )
 from copper_today.demo import build_demo_rows
 from copper_today.futures import completed_closes, fetch_copper_closes
+from copper_today.score import build_score_rows
+from copper_today.stories import (
+    StoryError,
+    format_cost,
+    group_stored_posts,
+    news_totals,
+    normalize_posts,
+)
 from copper_today.trends import fetch_trends_basket
 from copper_today.x_client import (
     SourceError,
@@ -79,6 +104,7 @@ def run_job(
     futures_fetcher=None,
     count_fetcher=None,
     search_fetcher=None,
+    story_fetcher=None,
 ) -> JobResult:
     now = _as_utc(now or datetime.now(timezone.utc))
     if demo:
@@ -109,7 +135,7 @@ def run_job(
         existing = get_day(conn, target.isoformat())
         demo_now = is_demo(conn)
 
-    x_steps, x_fields, x_note, write_note = _collect_x(
+    x_steps, x_fields, x_note, write_note, fresh_posts = _collect_x(
         target=target,
         now=now,
         token=token,
@@ -125,9 +151,10 @@ def run_job(
     future_rows = {} if futures_error else dict(futures_series or {})
     have_new = bool(trend_rows) or bool(future_rows) or bool(x_fields)
     replaced = False
+    keep_demo = demo_now and not have_new
 
     with connect(db_path) as conn:
-        if demo_now and not have_new:
+        if keep_demo:
             steps.append(
                 StepResult(
                     "database",
@@ -138,6 +165,7 @@ def run_job(
         else:
             if demo_now and have_new:
                 delete_all_metrics(conn)
+                clear_stories_and_scores(conn)
                 replaced = True
             if trend_rows:
                 clear_column(conn, "trends_interest")
@@ -154,19 +182,26 @@ def run_job(
             if write_note:
                 snapshot["note"] = x_note
             upsert_day(conn, target.isoformat(), snapshot)
+            if fresh_posts is not None:
+                replace_sampled_posts(conn, target.isoformat(), fresh_posts)
             set_meta(conn, "data_origin", "live")
-        set_meta(
-            conn,
-            "last_job_json",
-            json.dumps(
-                {
-                    "date": target.isoformat(),
-                    "at": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                    "replaced_demo": replaced,
-                    "steps": [asdict(step) for step in steps],
-                }
-            ),
+        if keep_demo:
+            _write_last_job(conn, target.isoformat(), now, replaced, steps)
+
+    if not keep_demo:
+        story_step, story_record = _prepare_stories(
+            db_path,
+            target.isoformat(),
+            fresh_posts=fresh_posts,
+            force_refresh=force_x,
+            story_fetcher=story_fetcher,
+            api_key=anthropic_api_key(),
         )
+        steps.append(story_step)
+        with connect(db_path) as conn:
+            _store_story_record(conn, target.isoformat(), story_record, fresh_posts)
+            _rebuild_scores(conn)
+            _write_last_job(conn, target.isoformat(), now, replaced, steps)
 
     return JobResult(date=target.isoformat(), steps=steps, replaced_demo=replaced)
 
@@ -179,23 +214,14 @@ def _run_demo(db_path: Path, *, now: datetime, replace_live: bool) -> JobResult:
                 "Refusing to replace collected rows with demo data. Pass --replace-live to overwrite them."
             )
         delete_all_metrics(conn)
+        clear_stories_and_scores(conn)
         for row in build_demo_rows(end):
             day = row.pop("date")
             upsert_day(conn, day, row)
+        _rebuild_scores(conn)
         set_meta(conn, "data_origin", "demo")
         steps = [StepResult("demo", "ok", f"90 synthetic days through {end.isoformat()}")]
-        set_meta(
-            conn,
-            "last_job_json",
-            json.dumps(
-                {
-                    "date": end.isoformat(),
-                    "at": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                    "replaced_demo": False,
-                    "steps": [asdict(step) for step in steps],
-                }
-            ),
-        )
+        _write_last_job(conn, end.isoformat(), now, False, steps)
     return JobResult(date=end.isoformat(), steps=steps)
 
 
@@ -209,10 +235,10 @@ def _collect_x(
     existing: dict | None,
     count_fetcher,
     search_fetcher,
-) -> tuple[list[StepResult], dict, str | None, bool]:
+) -> tuple[list[StepResult], dict, str | None, bool, list | None]:
     iso = target.isoformat()
     if skip_x:
-        return [StepResult("x", "skipped", "X snapshot not requested.")], {}, None, False
+        return [StepResult("x", "skipped", "X snapshot not requested.")], {}, None, False, None
     if not in_recent_window(target, now.date()):
         return (
             [
@@ -225,10 +251,11 @@ def _collect_x(
             {},
             None,
             False,
+            None,
         )
     if not token:
         message = "No X_BEARER_TOKEN in the environment."
-        return [StepResult("x", "error", message)], {}, message, True
+        return [StepResult("x", "error", message)], {}, message, True, None
 
     count_fetcher = count_fetcher or (lambda day, moment: fetch_recent_count(token, COPPER_QUERY, day, moment))
     search_fetcher = search_fetcher or (lambda day, moment: fetch_top_posts(token, COPPER_QUERY, day, moment))
@@ -236,6 +263,7 @@ def _collect_x(
     fields: dict = {}
     notes: list[str] = []
     write_note = False
+    fresh_posts = None
 
     if existing and existing.get("x_counts_ok") and not force_x:
         steps.append(StepResult("x counts", "skipped", "Already collected for this day."))
@@ -276,8 +304,106 @@ def _collect_x(
                 )
             )
             write_note = True
+            fresh_posts = normalize_posts(posts)
 
-    return steps, fields, "; ".join(notes) or None, write_note
+    return steps, fields, "; ".join(notes) or None, write_note, fresh_posts
+
+
+def _write_last_job(conn, day: str, now: datetime, replaced: bool, steps: list[StepResult]) -> None:
+    set_meta(
+        conn,
+        "last_job_json",
+        json.dumps(
+            {
+                "date": day,
+                "at": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "replaced_demo": replaced,
+                "steps": [asdict(step) for step in steps],
+            }
+        ),
+    )
+
+
+def _prepare_stories(
+    db_path: Path,
+    day: str,
+    *,
+    fresh_posts: list | None,
+    force_refresh: bool,
+    story_fetcher,
+    api_key: str,
+) -> tuple[StepResult, dict | None]:
+    with connect(db_path) as conn:
+        existing = list_stories(conn, day)
+        stored = load_sampled_posts(conn, day) if fresh_posts is None else []
+    posts = fresh_posts if fresh_posts is not None else stored
+    refreshed = fresh_posts is not None
+    if existing and not (force_refresh and refreshed):
+        return StepResult("stories", "skipped", "Already grouped for this day."), None
+    if not posts:
+        if refreshed:
+            detail = "The search returned no posts with ids to group."
+        else:
+            detail = "No stored posts for this day. Re-fetch X once so the next run can group them."
+        return StepResult("stories", "skipped", detail), None
+
+    fetcher = story_fetcher or (lambda rows: group_stored_posts(rows, api_key=api_key))
+    if story_fetcher is None and not api_key:
+        message = "No ANTHROPIC_API_KEY in the environment."
+        return (
+            StepResult("stories", "error", message),
+            {"status": "error", "detail": message},
+        )
+    try:
+        grouped = fetcher(posts)
+    except (StoryError, Exception) as exc:
+        message = _clean(exc, api_key)
+        return (
+            StepResult("stories", "error", message),
+            {"status": "error", "detail": message},
+        )
+    cost = format_cost(grouped.estimated_cost_usd)
+    detail = (
+        f"{len(grouped.stories)} stories, estimated {cost} "
+        f"({grouped.input_tokens} in / {grouped.output_tokens} out, {grouped.model})"
+    )
+    return (
+        StepResult("stories", "ok", detail),
+        {
+            "status": "ok",
+            "detail": detail,
+            "model": grouped.model,
+            "input_tokens": grouped.input_tokens,
+            "output_tokens": grouped.output_tokens,
+            "estimated_cost_usd": grouped.estimated_cost_usd,
+            "stories": grouped.stories,
+        },
+    )
+
+
+def _store_story_record(conn, day: str, record: dict | None, fresh_posts: list | None) -> None:
+    if record is None:
+        if fresh_posts is not None and not fresh_posts:
+            replace_stories(conn, day, [])
+        return
+    if record["status"] == "ok":
+        replace_stories(conn, day, record["stories"])
+    save_story_run(
+        conn,
+        day,
+        status=record["status"],
+        detail=record.get("detail"),
+        model=record.get("model"),
+        input_tokens=record.get("input_tokens"),
+        output_tokens=record.get("output_tokens"),
+        estimated_cost_usd=record.get("estimated_cost_usd"),
+    )
+
+
+def _rebuild_scores(conn) -> None:
+    frame = prepare(load_days(conn)).frame
+    totals = news_totals(list_stories(conn))
+    save_scores(conn, build_score_rows(frame, totals, DEFAULT_ATTENTION_WEIGHT))
 
 
 def _drop_open_session(conn, open_day: str) -> None:
