@@ -20,13 +20,16 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-Put an app-only bearer token in `.env`:
+Put the keys in `.env`:
 
 ```
 X_BEARER_TOKEN=your-token
+ANTHROPIC_API_KEY=your-claude-key
 ```
 
 `.env` stays on this machine. It is listed in `.gitignore`.
+
+`ANTHROPIC_API_KEY` is used for one Claude call per collected day. That call groups the posts already returned by the X search. It does not read X again. The model is Claude Haiku 5.5 with thinking turned off. The job prints the estimated cost from the published token rates and stores it with that day's stories.
 
 ## Set a monthly X spend cap first
 
@@ -71,6 +74,12 @@ python -m copper_today.job --demo
 ```
 
 Loads 90 synthetic days and does not call an API. The dashboard labels those rows. This refuses to overwrite collected data unless you pass `--replace-live`. The next live collection deletes the synthetic rows and keeps press-release markers.
+
+## Stories and the post-today score
+
+The top of the dashboard shows a green, yellow, or red score and the top three stories from that day's stored posts. Green means the score is in the top 25% of the last 30 days of the same kind of day (weekdays with weekdays, weekends with weekends). Red is the bottom 40%. Yellow is in between. Until 7 days have an index reading, the badge stays grey and says Calibrating. The sidebar weight defaults to 70% attention index and 30% story impressions.
+
+Stories are saved per day, so the date control can open an earlier day. Summaries are limited to what those posts say. A story with no named source in the posts is tagged unverified. If X, Google Trends, or Claude fails, the page still opens on the last saved rows and names the source that failed.
 
 ## Tests
 
